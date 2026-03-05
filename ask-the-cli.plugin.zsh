@@ -341,7 +341,8 @@ _call_anthropic() {
     local system_prompt="$(_sanitize_for_json "$1")"
     local user_message="$(_sanitize_for_json "$2")"
 
-    curl -s -X POST "$ASK_THE_CLI_API_URL" \
+    # Add timeouts: 10s to connect, 60s max total time
+    curl -s --connect-timeout 10 --max-time 60 -X POST "$ASK_THE_CLI_API_URL" \
         -H "Content-Type: application/json" \
         -H "x-api-key: $ASK_THE_CLI_API_KEY" \
         -H "anthropic-version: 2023-06-01" \
@@ -365,7 +366,8 @@ _call_openai() {
     local system_prompt="$(_sanitize_for_json "$1")"
     local user_message="$(_sanitize_for_json "$2")"
 
-    curl -s -X POST "$ASK_THE_CLI_API_URL" \
+    # Add timeouts: 10s to connect, 60s max total time
+    curl -s --connect-timeout 10 --max-time 60 -X POST "$ASK_THE_CLI_API_URL" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $ASK_THE_CLI_API_KEY" \
         -d @- <<EOF
@@ -391,7 +393,8 @@ _call_ollama() {
     local system_prompt="$(_sanitize_for_json "$1")"
     local user_message="$(_sanitize_for_json "$2")"
 
-    curl -s -X POST "$ASK_THE_CLI_API_URL" \
+    # Add timeouts: 10s to connect, 60s max total time
+    curl -s --connect-timeout 10 --max-time 60 -X POST "$ASK_THE_CLI_API_URL" \
         -H "Content-Type: application/json" \
         -d @- <<EOF
 {
@@ -412,13 +415,40 @@ _parse_response() {
 
     case "$ASK_THE_CLI_PROVIDER" in
         anthropic)
-            answer=$(echo "$response" | grep -o '"text":"[^"]*"' | head -1 | sed 's/"text":"\(.*\)"/\1/' | sed 's/\\n/\n/g')
+            # Try jq first, fallback to Python, then grep/sed
+            if command -v jq &> /dev/null; then
+                answer=$(echo "$response" | jq -r '.content[0].text // empty' 2>/dev/null)
+            fi
+            if [[ -z "$answer" ]] && command -v python3 &> /dev/null; then
+                answer=$(echo "$response" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('content', [{}])[0].get('text', ''))" 2>/dev/null)
+            fi
+            if [[ -z "$answer" ]]; then
+                answer=$(echo "$response" | grep -o '"text":"[^"]*"' | head -1 | sed 's/"text":"\(.*\)"/\1/' | sed 's/\\n/\n/g')
+            fi
             ;;
         openai)
-            answer=$(echo "$response" | grep -o '"content":"[^"]*"' | head -1 | sed 's/"content":"\(.*\)"/\1/' | sed 's/\\n/\n/g')
+            # Try jq first, fallback to Python, then grep/sed
+            if command -v jq &> /dev/null; then
+                answer=$(echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+            fi
+            if [[ -z "$answer" ]] && command -v python3 &> /dev/null; then
+                answer=$(echo "$response" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('choices', [{}])[0].get('message', {}).get('content', ''))" 2>/dev/null)
+            fi
+            if [[ -z "$answer" ]]; then
+                answer=$(echo "$response" | grep -o '"content":"[^"]*"' | head -1 | sed 's/"content":"\(.*\)"/\1/' | sed 's/\\n/\n/g')
+            fi
             ;;
         ollama)
-            answer=$(echo "$response" | grep -o '"response":"[^"]*"' | sed 's/"response":"\(.*\)"/\1/' | sed 's/\\n/\n/g')
+            # Try jq first, fallback to Python, then grep/sed
+            if command -v jq &> /dev/null; then
+                answer=$(echo "$response" | jq -r '.response // empty' 2>/dev/null)
+            fi
+            if [[ -z "$answer" ]] && command -v python3 &> /dev/null; then
+                answer=$(echo "$response" | python3 -c "import sys, json; print(json.load(sys.stdin).get('response', ''))" 2>/dev/null)
+            fi
+            if [[ -z "$answer" ]]; then
+                answer=$(echo "$response" | grep -o '"response":"[^"]*"' | head -1 | sed 's/"response":"\(.*\)"/\1/' | sed 's/\\n/\n/g')
+            fi
             ;;
     esac
 
@@ -426,7 +456,7 @@ _parse_response() {
 }
 
 # Main function to ask CLI questions
-ask() {
+_ask_internal() {
     # Run configuration wizard on first use
     if [[ "$ASK_THE_CLI_FIRST_RUN" == "true" ]]; then
         _ask_the_cli_config_wizard
@@ -459,20 +489,41 @@ ask() {
 
     # Call the appropriate API based on provider
     local response
+    local curl_exit_code
     case "$ASK_THE_CLI_PROVIDER" in
         anthropic)
             response=$(_call_anthropic "$system_prompt" "$formatted_question")
+            curl_exit_code=$?
             ;;
         openai)
             response=$(_call_openai "$system_prompt" "$formatted_question")
+            curl_exit_code=$?
             ;;
         ollama)
             response=$(_call_ollama "$system_prompt" "$formatted_question")
+            curl_exit_code=$?
             ;;
     esac
 
-    if [[ $? -ne 0 ]]; then
-        echo "Error: Failed to connect to $ASK_THE_CLI_PROVIDER API"
+    if [[ $curl_exit_code -ne 0 ]]; then
+        case $curl_exit_code in
+            28)
+                echo "Error: Request timed out. $ASK_THE_CLI_PROVIDER is taking too long to respond."
+                if [[ "$ASK_THE_CLI_PROVIDER" == "ollama" ]]; then
+                    echo "Make sure Ollama is running: ollama serve"
+                fi
+                ;;
+            7)
+                echo "Error: Failed to connect to $ASK_THE_CLI_PROVIDER API"
+                if [[ "$ASK_THE_CLI_PROVIDER" == "ollama" ]]; then
+                    echo "Make sure Ollama is running: ollama serve"
+                    echo "Or check that it's listening on: $ASK_THE_CLI_OLLAMA_HOST"
+                fi
+                ;;
+            *)
+                echo "Error: Failed to connect to $ASK_THE_CLI_PROVIDER API (exit code: $curl_exit_code)"
+                ;;
+        esac
         return 1
     fi
 
@@ -488,8 +539,13 @@ ask() {
     _print_animated "$answer"
 }
 
+# Wrapper with noglob to allow question marks and wildcards
+# Remove any existing alias to prevent conflicts
+unalias ask 2>/dev/null
+alias ask='noglob _ask_internal'
+
 # Function to get command suggestions based on partial input
-suggest() {
+_suggest_internal() {
     # Run configuration wizard on first use
     if [[ "$ASK_THE_CLI_FIRST_RUN" == "true" ]]; then
         _ask_the_cli_config_wizard
@@ -522,17 +578,43 @@ suggest() {
 
     # Call the appropriate API based on provider
     local response
+    local curl_exit_code
     case "$ASK_THE_CLI_PROVIDER" in
         anthropic)
             response=$(_call_anthropic "$system_prompt" "$user_message")
+            curl_exit_code=$?
             ;;
         openai)
             response=$(_call_openai "$system_prompt" "$user_message")
+            curl_exit_code=$?
             ;;
         ollama)
             response=$(_call_ollama "$system_prompt" "$user_message")
+            curl_exit_code=$?
             ;;
     esac
+
+    if [[ $curl_exit_code -ne 0 ]]; then
+        case $curl_exit_code in
+            28)
+                echo "Error: Request timed out. $ASK_THE_CLI_PROVIDER is taking too long to respond."
+                if [[ "$ASK_THE_CLI_PROVIDER" == "ollama" ]]; then
+                    echo "Make sure Ollama is running: ollama serve"
+                fi
+                ;;
+            7)
+                echo "Error: Failed to connect to $ASK_THE_CLI_PROVIDER API"
+                if [[ "$ASK_THE_CLI_PROVIDER" == "ollama" ]]; then
+                    echo "Make sure Ollama is running: ollama serve"
+                    echo "Or check that it's listening on: $ASK_THE_CLI_OLLAMA_HOST"
+                fi
+                ;;
+            *)
+                echo "Error: Failed to connect to $ASK_THE_CLI_PROVIDER API (exit code: $curl_exit_code)"
+                ;;
+        esac
+        return 1
+    fi
 
     # Parse response based on provider
     local answer=$(_parse_response "$response")
@@ -545,8 +627,13 @@ suggest() {
     _print_animated "$answer"
 }
 
+# Wrapper with noglob to allow question marks and wildcards
+# Remove any existing alias to prevent conflicts
+unalias suggest 2>/dev/null
+alias suggest='noglob _suggest_internal'
+
 # Interactive mode - ask multiple questions
-iask() {
+_iask_internal() {
     # Run configuration wizard on first use
     if [[ "$ASK_THE_CLI_FIRST_RUN" == "true" ]]; then
         _ask_the_cli_config_wizard
@@ -576,15 +663,20 @@ iask() {
         fi
 
         if [[ -n "$question" ]]; then
-            ask "$question"
+            _ask_internal "$question"
             echo ""
         fi
     done
 }
 
+# Wrapper with noglob to allow question marks and wildcards
+# Remove any existing alias to prevent conflicts
+unalias iask 2>/dev/null
+alias iask='noglob _iask_internal'
+
 # Alias for quick access
-alias askme='ask'
-alias suggestme='suggest'
+alias askme='noglob _ask_internal'
+alias suggestme='noglob _suggest_internal'
 
 # Add completion for common CLI tools
 _ask_completion() {
@@ -598,4 +690,7 @@ _ask_completion() {
     _describe 'ask starters' suggestions
 }
 
-compdef _ask_completion ask
+# Only set up completion if compdef is available
+if (( $+functions[compdef] )); then
+    compdef _ask_completion ask
+fi
