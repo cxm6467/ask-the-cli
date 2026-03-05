@@ -1,0 +1,28 @@
+# Environment files with API keys
+.env
+.env.local
+.env.*.local
+
+# API key files
+*.key
+*.pem
+*.apikey
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test files
+test_output/
+*.log
+
+# Backup files
+*.bak
+*.backup
